@@ -3,7 +3,7 @@
  * Plugin Name: EDD PipraPay
  * Plugin URI: https://piprapay.com
  * Description: Adds PipraPay as a payment gateway for Easy Digital Downloads.
- * Version: 1.0.0
+ * Version: 1.0.1
  * Author: PipraPay
  * Author URI: https://piprapay.com
  * License: GPL v2 or later
@@ -16,21 +16,17 @@ if (!defined('ABSPATH')) {
 }
 
 // Register the gateway
-add_filter('edd_payment_gateways', 'edd_register_piprapay_gateway');
-function edd_register_piprapay_gateway($gateways)
-{
+add_filter('edd_payment_gateways', function ($gateways) {
     $gateways['piprapay'] = [
         'admin_label'    => 'PipraPay',
         'checkout_label' => __('Pay with PipraPay', 'edd')
     ];
     return $gateways;
-}
+});
 
-// Settings
-add_filter('edd_settings_gateways', 'edd_piprapay_settings');
-function edd_piprapay_settings($settings)
-{
-    $piprapay_settings = [
+// Settings fields
+add_filter('edd_settings_gateways', function ($settings) {
+    return array_merge($settings, [
         [
             'id'   => 'piprapay_settings',
             'name' => '<strong>' . __('PipraPay Settings', 'edd') . '</strong>',
@@ -54,20 +50,11 @@ function edd_piprapay_settings($settings)
             'type' => 'text',
             'std'  => 'BDT'
         ],
-        [
-            'id'   => 'piprapay_webhook_secret',
-            'name' => 'Webhook Secret/API Key',
-            'type' => 'text'
-        ],
-    ];
+    ]);
+});
 
-    return array_merge($settings, $piprapay_settings);
-}
-
-// Process the payment
-add_action('edd_gateway_piprapay', 'edd_process_piprapay_payment');
-function edd_process_piprapay_payment($purchase_data)
-{
+// Process checkout payment
+add_action('edd_gateway_piprapay', function ($purchase_data) {
     global $edd_options;
 
     $api_url  = trailingslashit($edd_options['piprapay_api_url']);
@@ -87,15 +74,10 @@ function edd_process_piprapay_payment($purchase_data)
     ];
 
     $payment_id = edd_insert_payment($payment_data);
-
     if (!$payment_id) {
         edd_send_back_to_checkout('?payment-mode=piprapay');
         return;
     }
-
-    $metadata = [
-        'invoiceid' => $purchase_data['purchase_key'],
-    ];
 
     $post_data = [
         'full_name'    => $purchase_data['user_info']['first_name'] . ' ' . $purchase_data['user_info']['last_name'],
@@ -106,7 +88,7 @@ function edd_process_piprapay_payment($purchase_data)
         'webhook_url'  => site_url('/?edd-listener=piprapay'),
         'return_type'  => 'GET',
         'currency'     => $currency,
-        'metadata'     => $metadata
+        'metadata'     => ['invoiceid' => $purchase_data['purchase_key']]
     ];
 
     $response = wp_remote_post($api_url . 'create-charge', [
@@ -116,7 +98,7 @@ function edd_process_piprapay_payment($purchase_data)
             'accept'       => 'application/json',
             'mh-piprapay-api-key' => $api_key
         ],
-        'body'      => json_encode($post_data),
+        'body'        => json_encode($post_data),
         'data_format' => 'body'
     ]);
 
@@ -135,22 +117,19 @@ function edd_process_piprapay_payment($purchase_data)
     } else {
         edd_send_back_to_checkout('?payment-mode=piprapay');
     }
-}
+});
 
-// Webhook Listener
-add_action('init', 'edd_piprapay_webhook_listener');
-function edd_piprapay_webhook_listener()
-{
-    if (!isset($_GET['edd-listener']) || $_GET['edd-listener'] !== 'piprapay') {
-        return;
-    }
+// Webhook Listener for PipraPay
+add_action('init', function () {
+    if (!isset($_GET['edd-listener']) || $_GET['edd-listener'] !== 'piprapay') return;
 
     $raw = file_get_contents("php://input");
     $data = json_decode($raw, true);
     $headers = getallheaders();
-    $api_key_received = $headers['mh-piprapay-api-key'] ?? ($headers['Mh-Piprapay-Api-Key'] ?? $_SERVER['HTTP_MH_PIPRAPAY_API_KEY']);
 
-    $expected_key = edd_get_option('piprapay_webhook_secret');
+    $api_key_received = $headers['mh-piprapay-api-key'] ?? ($headers['Mh-Piprapay-Api-Key'] ?? $_SERVER['HTTP_MH_PIPRAPAY_API_KEY']);
+    $expected_key = edd_get_option('piprapay_api_key');
+    $api_url      = trailingslashit(edd_get_option('piprapay_api_url'));
 
     if ($api_key_received !== $expected_key) {
         status_header(401);
@@ -160,24 +139,37 @@ function edd_piprapay_webhook_listener()
 
     if (!isset($data['metadata']['invoiceid'])) {
         status_header(400);
-        echo json_encode(["status" => false, "message" => "Invalid data."]);
+        echo json_encode(["status" => false, "message" => "Invalid webhook data."]);
         exit;
     }
 
     $invoice = $data['metadata']['invoiceid'];
-
     $payment = edd_get_payment_by('key', $invoice);
+
     if (!$payment) {
         status_header(404);
         echo json_encode(["status" => false, "message" => "Payment not found."]);
         exit;
     }
 
-    if ($data['status'] === 'completed') {
+    // Optional: Double verification with PipraPay
+    $verify = wp_remote_post($api_url . 'verify-payments', [
+        'method'    => 'POST',
+        'headers'   => [
+            'Content-Type' => 'application/json',
+            'accept'       => 'application/json',
+            'mh-piprapay-api-key' => $expected_key
+        ],
+        'body' => json_encode(['pp_id' => $data['pp_id']]),
+    ]);
+
+    $verify_data = json_decode(wp_remote_retrieve_body($verify), true);
+
+    if (isset($verify_data['status']) && $verify_data['status'] === 'completed') {
         edd_update_payment_status($payment->ID, 'publish');
-        edd_insert_payment_note($payment->ID, 'PipraPay transaction ID: ' . $data['transaction_id']);
+        edd_insert_payment_note($payment->ID, 'PipraPay transaction ID: ' . $verify_data['transaction_id']);
     }
 
     echo json_encode(["status" => true]);
     exit;
-}
+});
