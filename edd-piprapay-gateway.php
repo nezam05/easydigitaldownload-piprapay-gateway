@@ -173,3 +173,17 @@ add_action('init', function () {
     echo json_encode(["status" => true]);
     exit;
 });
+
+/**
+ * Disables the credit card form for the PipraPay gateway.
+ *
+ * @return bool False if PipraPay is the selected gateway, otherwise the original value.
+ */
+
+function edd_piprapay_cc_form()
+{
+    if (edd_get_chosen_gateway() === 'piprapay') {
+        return false;
+    }
+}
+add_action('edd_piprapay_cc_form', 'edd_piprapay_cc_form');
